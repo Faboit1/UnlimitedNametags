@@ -1,9 +1,11 @@
 name: Build
 
 on:
+  # Pull requests cover every branch under review (including ones from forks); push only covers
+  # the mainline. Listing both for all branches builds each PR commit twice for no extra signal.
   push:
     branches:
-      - "**"
+      - main
     paths-ignore:
       - "**.md"
       - "LICENSE"
@@ -15,7 +17,7 @@ on:
 
 # One in-flight build per branch/PR; superseded runs are cancelled to save runner time.
 concurrency:
-  group: build-${{ github.workflow }}-${{ github.ref }}
+  group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -61,7 +63,9 @@ jobs:
       - name: Upload plugin jar
         uses: actions/upload-artifact@v4
         with:
-          name: UnlimitedNametags-${{ github.sha }}
+          # github.sha is a synthetic merge commit on pull_request events; name the jar after the
+          # real head commit so it can be matched against the branch history.
+          name: UnlimitedNametags-${{ github.event.pull_request.head.sha || github.sha }}
           path: target/UnlimitedNametags.jar
           if-no-files-found: error
           retention-days: 30
@@ -70,7 +74,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports-${{ github.sha }}
+          name: test-reports-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             **/build/reports/tests/
             **/build/test-results/

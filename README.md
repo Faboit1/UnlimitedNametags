@@ -48,10 +48,11 @@ gradlew.bat :paper:shadowJar
 
 The server jar is written to `target/UnlimitedNametags.jar`.
 
-Every push and pull request is compiled and tested automatically by the
+Every pull request, and every commit on `main`, is compiled and tested automatically by the
 [Build workflow](.github/workflows/build.yml). The resulting `UnlimitedNametags.jar` is attached to
 the run as an artifact, so a jar for any commit can be downloaded from its Actions run without
-building locally.
+building locally. The workflow can also be started by hand from the Actions tab for a branch that
+has no open pull request.
 
 ## API
 
