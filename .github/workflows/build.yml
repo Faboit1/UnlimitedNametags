@@ -1,0 +1,78 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - "**"
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  workflow_dispatch:
+
+# One in-flight build per branch/PR; superseded runs are cancelled to save runner time.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compile & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # JDK 25 provides the Gradle toolchain the modules compile with (release 17 bytecode);
+      # JDK 21 is installed last so it wins JAVA_HOME and runs the Gradle daemon itself.
+      - name: Set up JDKs
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            25
+            21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Only the default branch writes the shared dependency/build cache; other refs read it.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Build (compile, test, shadow jar)
+        run: |
+          set -euo pipefail
+          args=(build --stacktrace)
+          # Point Gradle at the JDK 25 setup-java installed. If it is somehow missing, fall through
+          # and let the foojay resolver in settings.gradle.kts provision the toolchain instead.
+          if [ -n "${JAVA_HOME_25_X64:-}" ]; then
+            args+=("-Porg.gradle.java.installations.paths=$JAVA_HOME_25_X64")
+          fi
+          ./gradlew "${args[@]}"
+
+      - name: Upload plugin jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: UnlimitedNametags-${{ github.sha }}
+          path: target/UnlimitedNametags.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ github.sha }}
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+          if-no-files-found: ignore
+          retention-days: 7

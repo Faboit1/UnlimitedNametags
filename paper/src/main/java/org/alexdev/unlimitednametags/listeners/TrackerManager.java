@@ -134,13 +134,11 @@ public class TrackerManager {
      * @param player The player to reset.
      */
     public void forceUntrack(@NotNull Player player) {
-        Set<UUID> tracked = trackedPlayers.get(player.getUniqueId());
-        if (tracked == null || tracked.isEmpty())
+        // get() already hands back a fresh snapshot, so iterating it cannot hit a
+        // ConcurrentModificationException from removePlayerInternal below.
+        Set<UUID> targetsSnapshot = trackedPlayers.get(player.getUniqueId());
+        if (targetsSnapshot.isEmpty())
             return;
-
-        // Copy to avoid ConcurrentModification during iteration if necessary,
-        // although removePlayerInternal handles concurrency.
-        Set<UUID> targetsSnapshot = new HashSet<>(tracked);
 
         Map<UUID, Player> onlinePlayers = plugin.getPlayerListener().getOnlinePlayers();
 
@@ -166,7 +164,8 @@ public class TrackerManager {
             }
         }
 
-        final Set<UUID> cachedTargets = new HashSet<>(trackedPlayers.get(playerId));
+        // get() already returns a fresh mutable snapshot; no extra copy needed.
+        final Set<UUID> cachedTargets = trackedPlayers.get(playerId);
         final Set<UUID> targetsToRemove = new HashSet<>(cachedTargets);
         targetsToRemove.removeAll(currentTargets);
         final Set<UUID> targetsToAdd = new HashSet<>(currentTargets);
@@ -189,7 +188,7 @@ public class TrackerManager {
                 .map(Player::getUniqueId)
                 .filter(viewerId -> !viewerId.equals(playerId))
                 .collect(java.util.stream.Collectors.toSet());
-        final Set<UUID> cachedViewers = new HashSet<>(trackedBy.get(playerId));
+        final Set<UUID> cachedViewers = trackedBy.get(playerId);
         final Set<UUID> viewersToRemove = new HashSet<>(cachedViewers);
         viewersToRemove.removeAll(currentViewers);
         final Set<UUID> viewersToAdd = new HashSet<>(currentViewers);
@@ -218,16 +217,19 @@ public class TrackerManager {
      */
     @NotNull
     public List<Player> getWhoTracks(@NotNull Player target) {
-        final List<Player> trackers = new ArrayList<>();
-        final Map<UUID, Player> onlinePlayers = plugin.getPlayerListener().getOnlinePlayers();
+        // Hot path: called for every nametag row on several repeating tasks. Iterate the live view
+        // instead of materialising a defensive HashSet copy first.
+        final Set<UUID> trackerUuids = trackedBy.view(target.getUniqueId());
+        if (trackerUuids.isEmpty()) {
+            return List.of();
+        }
 
-        Set<UUID> trackerUuids = trackedBy.get(target.getUniqueId());
-        if (trackerUuids != null) {
-            for (UUID uuid : trackerUuids) {
-                Player p = onlinePlayers.get(uuid);
-                if (p != null) {
-                    trackers.add(p);
-                }
+        final Map<UUID, Player> onlinePlayers = plugin.getPlayerListener().getOnlinePlayers();
+        final List<Player> trackers = new ArrayList<>(trackerUuids.size());
+        for (UUID uuid : trackerUuids) {
+            Player p = onlinePlayers.get(uuid);
+            if (p != null) {
+                trackers.add(p);
             }
         }
         return trackers;

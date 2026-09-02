@@ -67,9 +67,32 @@ public enum Formatter {
         this.name = name;
     }
 
+    /**
+     * {@link TextFormatter} ordinal → {@link Formatter}, resolved once instead of doing a
+     * {@code valueOf(name())} string lookup for every nametag line of every viewer on every refresh.
+     * An entry stays {@code null} when no constant matches, so {@link #from(TextFormatter)} keeps
+     * throwing the same {@link IllegalArgumentException} it always did.
+     */
+    private static final Formatter[] BY_TEXT_FORMATTER = buildTextFormatterLookup();
+
+    @NotNull
+    private static Formatter[] buildTextFormatterLookup() {
+        final TextFormatter[] textFormatters = TextFormatter.values();
+        final Formatter[] lookup = new Formatter[textFormatters.length];
+        for (int i = 0; i < textFormatters.length; i++) {
+            try {
+                lookup[i] = valueOf(textFormatters[i].name());
+            } catch (IllegalArgumentException ignored) {
+                lookup[i] = null;
+            }
+        }
+        return lookup;
+    }
+
     @NotNull
     public static Formatter from(@NotNull TextFormatter textFormatter) {
-        return valueOf(textFormatter.name());
+        final Formatter cached = BY_TEXT_FORMATTER[textFormatter.ordinal()];
+        return cached != null ? cached : valueOf(textFormatter.name());
     }
 
     public Component format(@NotNull UnlimitedNameTagsInstancePaper plugin, @NotNull CommandSender audience, @NotNull String text) {

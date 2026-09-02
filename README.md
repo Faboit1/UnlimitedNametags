@@ -4,6 +4,7 @@
 
 Custom stacked nametags for Paper servers: text, item, and block display rows with placeholders, animations, visibility rules, and a developer API.
 
+[![Build](https://github.com/alexdev03/UnlimitedNameTags/actions/workflows/build.yml/badge.svg)](https://github.com/alexdev03/UnlimitedNameTags/actions/workflows/build.yml)
 [![GitHub Release](https://img.shields.io/github/release/alexdev03/unlimitednametags.svg)](https://github.com/alexdev03/UnlimitedNameTags/releases)
 [![CodeFactor](https://www.codefactor.io/repository/github/alexdev03/unlimitednametags/badge)](https://www.codefactor.io/repository/github/alexdev03/unlimitednametags)
 [![BuiltByBit](https://img.shields.io/badge/BuiltByBit-resource-lightblue?style=for-the-badge)](https://builtbybit.com/resources/unlimitednametags.46172/)
@@ -46,6 +47,11 @@ gradlew.bat :paper:shadowJar
 ```
 
 The server jar is written to `target/UnlimitedNametags.jar`.
+
+Every push and pull request is compiled and tested automatically by the
+[Build workflow](.github/workflows/build.yml). The resulting `UnlimitedNametags.jar` is attached to
+the run as an artifact, so a jar for any commit can be downloaded from its Actions run without
+building locally.
 
 ## API
 

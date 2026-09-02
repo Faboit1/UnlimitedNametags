@@ -52,6 +52,10 @@ import java.util.stream.Collectors;
 @Getter
 public class NameTagManager implements UntNametagManagerPaper {
 
+    /** Radius within which {@link #handleVanish(Player, PacketNameTag)} replays a nametag to nearby players. */
+    private static final double VANISH_REPLAY_DISTANCE_SQUARED = 250 * 250;
+    /** {@link #isPlayerPointingAt(Player, Player)} treats anything closer than 5 blocks as "looking at". */
+    private static final double POINTING_NEAR_DISTANCE_SQUARED = 5 * 5;
     private static final float COMPACT_ITEM_DISPLAY_HEIGHT_BLOCKS = 0.35f;
     private static final float COMPACT_BLOCK_DISPLAY_HEIGHT_BLOCKS = 0.5f;
 
@@ -153,29 +157,42 @@ public class NameTagManager implements UntNametagManagerPaper {
                         return;
                     }
                     final long nowTick = refreshSweepTick.addAndGet(baseRefreshInterval);
-                    nameTags.values().stream()
-                            .flatMap(Collection::stream)
-                            .map(tag -> paperRow(tag).getOwner())
-                            .filter(Objects::nonNull)
-                            .distinct()
-                            .filter(owner -> shouldRefreshOwnerThisSweep(owner, nowTick, baseRefreshInterval))
-                            .forEach(owner -> refresh(owner, false));
+                    for (final Map.Entry<UUID, CopyOnWriteArrayList<PacketNameTag>> entry : nameTags.entrySet()) {
+                        if (entry.getValue().isEmpty()) {
+                            continue;
+                        }
+                        final Player owner = plugin.getPlayerListener().getPlayer(entry.getKey());
+                        if (owner == null) {
+                            continue;
+                        }
+                        if (shouldRefreshOwnerThisSweep(owner, nowTick, baseRefreshInterval)) {
+                            refresh(owner, false);
+                        }
+                    }
                 },
                 10, baseRefreshInterval);
         tasks.add(refresh);
 
         // Refresh passengers
-        final MyScheduledTask passengers = plugin.getTaskScheduler().runTaskTimerAsynchronously(() -> nameTags.values()
-                .stream()
-                .flatMap(Collection::stream)
-                .map(tag -> paperRow(tag).getOwner())
-                .filter(Objects::nonNull)
-                .distinct()
-                .filter(p -> plugin.getHook(HMCCosmeticsHook.class).map(h -> !h.hasBackpack(p)).orElse(true))
-                .forEach(player -> getPacketDisplays(player).stream()
-                        .findFirst()
-                        .ifPresent(tag -> ((PacketNameTag) tag).sendPassengerPacketToViewers())),
-                20, 20 * 5L);
+        final MyScheduledTask passengers = plugin.getTaskScheduler().runTaskTimerAsynchronously(() -> {
+            final HMCCosmeticsHook cosmetics = plugin.getHook(HMCCosmeticsHook.class).orElse(null);
+            for (final Map.Entry<UUID, CopyOnWriteArrayList<PacketNameTag>> entry : nameTags.entrySet()) {
+                final CopyOnWriteArrayList<PacketNameTag> tags = entry.getValue();
+                if (tags.isEmpty()) {
+                    continue;
+                }
+                final Player owner = plugin.getPlayerListener().getPlayer(entry.getKey());
+                if (owner == null || (cosmetics != null && cosmetics.hasBackpack(owner))) {
+                    continue;
+                }
+                // Iterate rather than get(0): the copy-on-write iterator is a snapshot, so a row
+                // removed concurrently cannot turn this into an IndexOutOfBoundsException.
+                for (final PacketNameTag first : tags) {
+                    first.sendPassengerPacketToViewers();
+                    break;
+                }
+            }
+        }, 20, 20 * 5L);
         tasks.add(passengers);
 
         // Scale task
@@ -192,25 +209,29 @@ public class NameTagManager implements UntNametagManagerPaper {
 
         if (plugin.getConfigManager().getSettings().getVisibility().isShowWhileLooking()) {
             final MyScheduledTask point = plugin.getTaskScheduler().runTaskTimerAsynchronously(() -> {
+                final ViaVersionHook viaHook = plugin.getHook(ViaVersionHook.class).orElse(null);
+                final boolean hideThroughWalls = plugin.getConfigManager().getSettings().getVisibility()
+                        .getThroughWallMode() == Settings.ThroughWallMode.HIDE;
                 nameTags.values().forEach(tags -> tags.forEach(tag -> {
-                    final Player targetOwner = paperRow(tag).getOwner();
+                    final PaperNametagRow row = paperRow(tag);
+                    final Player targetOwner = row.getOwner();
                     final List<Player> viewers = plugin.getTrackerManager().getWhoTracks(targetOwner);
 
                     for (Player viewer : viewers) {
-                        if (plugin.getHook(ViaVersionHook.class).map(h -> h.hasNotTextDisplays(viewer)).orElse(false)) {
+                        if (viaHook != null && viaHook.hasNotTextDisplays(viewer)) {
                             continue;
                         }
 
                         boolean isPointing = isPlayerPointingAt(viewer, targetOwner);
-                        if (isPointing && plugin.getConfigManager().getSettings().getVisibility().getThroughWallMode()
-                                == Settings.ThroughWallMode.HIDE && !viewer.hasLineOfSight(targetOwner)) {
+                        if (isPointing && hideThroughWalls && !viewer.hasLineOfSight(targetOwner)) {
                             isPointing = false;
                         }
 
-                        if (paperRow(tag).canPlayerSee(viewer) && !isPointing) {
-                            paperRow(tag).hideFromPlayer(viewer);
-                        } else if (!paperRow(tag).canPlayerSee(viewer) && isPointing) {
-                            paperRow(tag).showToPlayer(viewer);
+                        final boolean canSee = row.canPlayerSee(viewer);
+                        if (canSee && !isPointing) {
+                            row.hideFromPlayer(viewer);
+                        } else if (!canSee && isPointing) {
+                            row.showToPlayer(viewer);
                         }
                     }
                 }));
@@ -309,18 +330,21 @@ public class NameTagManager implements UntNametagManagerPaper {
         } else if (mode == Settings.ThroughWallMode.HIDE) {
             for (final CopyOnWriteArrayList<PacketNameTag> tags : nameTags.values()) {
                 for (final PacketNameTag tag : tags) {
-                    final Player owner = paperRow(tag).getOwner();
+                    final PaperNametagRow row = paperRow(tag);
+                    final Player owner = row.getOwner();
                     if (owner == null) {
                         continue;
                     }
-                    final PaperNametagRow row = paperRow(tag);
+                    final Location ownerLocation = owner.getLocation();
+                    final UUID ownerId = owner.getUniqueId();
                     final List<Player> viewers = plugin.getTrackerManager().getWhoTracks(owner);
                     for (final Player viewer : viewers) {
-                        if (viewer.getUniqueId().equals(owner.getUniqueId())) {
+                        if (viewer.getUniqueId().equals(ownerId)) {
                             continue;
                         }
-                        final double distSq = viewer.getLocation().distanceSquared(owner.getLocation());
-                        final boolean withinRange = distSq <= maxSq;
+                        final Location viewerLocation = viewer.getLocation();
+                        final boolean sameWorld = viewerLocation.getWorld() == ownerLocation.getWorld();
+                        final boolean withinRange = sameWorld && viewerLocation.distanceSquared(ownerLocation) <= maxSq;
                         final boolean hasLoS = withinRange && viewer.hasLineOfSight(owner);
 
                         if (hasLoS) {
@@ -353,12 +377,15 @@ public class NameTagManager implements UntNametagManagerPaper {
             return false;
         }
 
-        if (player1.getLocation().distance(player2.getLocation()) < 5) {
+        // Squared compare: same 5-block threshold without the square root.
+        if (player1.getLocation().distanceSquared(player2.getLocation()) < POINTING_NEAR_DISTANCE_SQUARED) {
             return true;
         }
 
-        final org.bukkit.util.Vector direction = player1.getEyeLocation().getDirection();
-        final Vector toPlayer2 = player2.getEyeLocation().toVector().subtract(player1.getEyeLocation().toVector());
+        final Location eye1 = player1.getEyeLocation();
+        final Location eye2 = player2.getEyeLocation();
+        final Vector direction = eye1.getDirection();
+        final Vector toPlayer2 = eye2.toVector().subtract(eye1.toVector());
         toPlayer2.normalize();
 
         final double dotProduct = direction.dot(toPlayer2);
@@ -1326,10 +1353,14 @@ public class NameTagManager implements UntNametagManagerPaper {
 
     @NotNull
     private List<Player> relationalPlayersForRefresh(@NotNull Player owner, @NotNull PacketNameTag display) {
-        final List<Player> fromViewers = display.getViewers().stream()
-                .map(Bukkit::getPlayer)
-                .filter(Objects::nonNull)
-                .toList();
+        final Collection<UUID> viewerIds = display.getViewers();
+        final List<Player> fromViewers = new ArrayList<>(viewerIds.size());
+        for (final UUID viewerId : viewerIds) {
+            final Player viewer = Bukkit.getPlayer(viewerId);
+            if (viewer != null) {
+                fromViewers.add(viewer);
+            }
+        }
         if (!fromViewers.isEmpty()) {
             return fromViewers;
         }
@@ -1341,16 +1372,30 @@ public class NameTagManager implements UntNametagManagerPaper {
 
     private void handleVanish(@NotNull Player player, @NotNull PacketNameTag display) {
         final boolean isVanished = plugin.getVanishManager().isVanished(player);
+        final PaperNametagRow row = paperRow(display);
+        final Location playerLocation = player.getLocation();
+        final World playerWorld = playerLocation.getWorld();
 
         // if player is vanished, hide display for all players except for who can see
         // the player
-        plugin.getPlayerListener().getOnlinePlayers().values().stream()
-                .filter(p -> p != player)
-                .filter(p -> p.getLocation().getWorld() == player.getLocation().getWorld())
-                .filter(p -> !isVanished || plugin.getVanishManager().canSee(p, player))
-                .filter(p -> p.getLocation().distance(player.getLocation()) <= 250)
-                .filter(p -> !paperRow(display).canPlayerSee(p))
-                .forEach(p -> paperRow(display).showToPlayer(p));
+        for (final Player p : plugin.getPlayerListener().getOnlinePlayers().values()) {
+            if (p == player) {
+                continue;
+            }
+            final Location otherLocation = p.getLocation();
+            if (otherLocation.getWorld() != playerWorld) {
+                continue;
+            }
+            if (isVanished && !plugin.getVanishManager().canSee(p, player)) {
+                continue;
+            }
+            if (otherLocation.distanceSquared(playerLocation) > VANISH_REPLAY_DISTANCE_SQUARED) {
+                continue;
+            }
+            if (!row.canPlayerSee(p)) {
+                row.showToPlayer(p);
+            }
+        }
     }
 
     public void removePlayer(@NotNull Player player) {
@@ -1399,15 +1444,20 @@ public class NameTagManager implements UntNametagManagerPaper {
         }
         final CopyOnWriteArrayList<PacketNameTag> tagList = nameTags.get(player.getUniqueId());
         final List<PacketNameTag> packetNameTags = tagList == null ? List.of() : tagList;
+        // Filter the tracked viewers once rather than once per row.
+        final Set<Player> onlineTracked = tracked.stream()
+                .filter(Objects::nonNull)
+                .filter(Player::isOnline)
+                .collect(Collectors.toSet());
         for (PacketNameTag packetNameTag : packetNameTags) {
             packetNameTag.setVisible(true);
-            final Set<Player> players = tracked.stream()
-                    .filter(Objects::nonNull)
-                    .filter(Player::isOnline)
-                    .collect(Collectors.toSet());
             final PaperNametagRow row = paperRow(packetNameTag);
+            final Set<Player> players;
             if (includeOwner) {
+                players = new HashSet<>(onlineTracked);
                 players.add(row.getOwner());
+            } else {
+                players = onlineTracked;
             }
             row.showToPlayers(players);
             if (debug) {
