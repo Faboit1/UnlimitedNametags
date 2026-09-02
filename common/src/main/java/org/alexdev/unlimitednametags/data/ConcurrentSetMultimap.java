@@ -10,9 +10,28 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ConcurrentSetMultimap<K, V> {
 
     // Hash-set buckets: put/remove/containsEntry are O(1) instead of the O(n) scans a queue needs.
-    // The per-bucket synchronization is kept so "remove last value" and "drop the empty key" stay atomic
-    // against a concurrent put on the same key.
+    //
+    // A bucket is "published" while map.get(key) returns it. remove() drops a bucket from the map once it
+    // empties, so a bucket reference obtained before acquiring its lock may already be detached by the time
+    // the lock is granted; mutating it then would be invisible to everyone else. Every mutator therefore
+    // re-checks publication while holding the bucket lock and retries against a fresh bucket if it lost the
+    // race. Because detach only ever happens under that same lock, a bucket seen as published while holding
+    // it stays published for the duration of the critical section.
     private final ConcurrentHashMap<K, Set<V>> map = new ConcurrentHashMap<>();
+
+    /**
+     * Returns the bucket currently published for {@code key}, creating one if needed. The caller must hold no
+     * bucket lock; the returned bucket may be detached before the caller locks it, which is why every mutator
+     * re-checks {@link #isPublished(Object, Set)} inside its critical section.
+     */
+    private Set<V> bucketFor(K key) {
+        return map.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
+    }
+
+    /** Must be called while holding {@code bucket}'s monitor. */
+    private boolean isPublished(K key, Set<V> bucket) {
+        return map.get(key) == bucket;
+    }
 
     /**
      * Adds the value to the specified key.
@@ -23,11 +42,17 @@ public class ConcurrentSetMultimap<K, V> {
      * @return true if the value was added, false otherwise
      */
     public boolean put(K key, V value) {
-        // Create a new bucket if one does not already exist for the key
-        Set<V> bucket = map.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
-        // Ensure uniqueness by synchronizing on the bucket for this key
-        synchronized (bucket) {
-            return bucket.add(value);
+        while (true) {
+            // Create a new bucket if one does not already exist for the key
+            Set<V> bucket = bucketFor(key);
+            // Ensure uniqueness by synchronizing on the bucket for this key
+            synchronized (bucket) {
+                if (isPublished(key, bucket)) {
+                    return bucket.add(value);
+                }
+            }
+            // A concurrent remove emptied and dropped this bucket before we locked it; adding to it now
+            // would silently lose the value. Retry against whatever bucket is published next.
         }
     }
 
@@ -40,10 +65,15 @@ public class ConcurrentSetMultimap<K, V> {
      * @return true if at least one value was added, false otherwise
      */
     public boolean putAll(K key, Collection<? extends V> values) {
-        // Create a new bucket if one does not already exist for the key
-        Set<V> bucket = map.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
-        synchronized (bucket) {
-            return bucket.addAll(values);
+        while (true) {
+            // Create a new bucket if one does not already exist for the key
+            Set<V> bucket = bucketFor(key);
+            synchronized (bucket) {
+                if (isPublished(key, bucket)) {
+                    return bucket.addAll(values);
+                }
+            }
+            // Same detach race as put(K, V); retry against the bucket that is published now.
         }
     }
 
@@ -87,16 +117,22 @@ public class ConcurrentSetMultimap<K, V> {
      * @return true if the value was removed, false otherwise
      */
     public boolean remove(K key, V value) {
-        Set<V> bucket = map.get(key);
-        if (bucket == null) {
-            return false;
-        }
-        synchronized (bucket) {
-            boolean removed = bucket.remove(value);
-            if (bucket.isEmpty()) {
-                map.remove(key, bucket);
+        while (true) {
+            Set<V> bucket = map.get(key);
+            if (bucket == null) {
+                return false;
             }
-            return removed;
+            synchronized (bucket) {
+                if (isPublished(key, bucket)) {
+                    boolean removed = bucket.remove(value);
+                    if (bucket.isEmpty()) {
+                        map.remove(key, bucket);
+                    }
+                    return removed;
+                }
+            }
+            // This bucket was dropped before we locked it, so the value may live in its replacement.
+            // Retry rather than reporting "not removed" against a bucket nobody can see.
         }
     }
 
