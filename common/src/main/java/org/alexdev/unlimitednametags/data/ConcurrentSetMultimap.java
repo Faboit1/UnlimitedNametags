@@ -2,14 +2,17 @@ package org.alexdev.unlimitednametags.data;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class ConcurrentSetMultimap<K, V> {
 
-    private final ConcurrentHashMap<K, ConcurrentLinkedQueue<V>> map = new ConcurrentHashMap<>();
+    // Hash-set buckets: put/remove/containsEntry are O(1) instead of the O(n) scans a queue needs.
+    // The per-bucket synchronization is kept so "remove last value" and "drop the empty key" stay atomic
+    // against a concurrent put on the same key.
+    private final ConcurrentHashMap<K, Set<V>> map = new ConcurrentHashMap<>();
 
     /**
      * Adds the value to the specified key.
@@ -20,15 +23,12 @@ public class ConcurrentSetMultimap<K, V> {
      * @return true if the value was added, false otherwise
      */
     public boolean put(K key, V value) {
-        // Create a new queue if one does not already exist for the key
-        ConcurrentLinkedQueue<V> queue = map.computeIfAbsent(key, k -> new ConcurrentLinkedQueue<>());
-        // Ensure uniqueness by synchronizing on the queue for this key
-        synchronized (queue) {
-            if (!queue.contains(value)) {
-                return queue.add(value);
-            }
+        // Create a new bucket if one does not already exist for the key
+        Set<V> bucket = map.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
+        // Ensure uniqueness by synchronizing on the bucket for this key
+        synchronized (bucket) {
+            return bucket.add(value);
         }
-        return false;
     }
 
     /**
@@ -40,18 +40,11 @@ public class ConcurrentSetMultimap<K, V> {
      * @return true if at least one value was added, false otherwise
      */
     public boolean putAll(K key, Collection<? extends V> values) {
-        // Create a new queue if one does not already exist for the key
-        ConcurrentLinkedQueue<V> queue = map.computeIfAbsent(key, k -> new ConcurrentLinkedQueue<>());
-        boolean changed = false;
-        synchronized (queue) {
-            for (V value : values) {
-                if (!queue.contains(value)) {
-                    queue.add(value);
-                    changed = true;
-                }
-            }
+        // Create a new bucket if one does not already exist for the key
+        Set<V> bucket = map.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
+        synchronized (bucket) {
+            return bucket.addAll(values);
         }
-        return changed;
     }
 
     /**
@@ -61,33 +54,47 @@ public class ConcurrentSetMultimap<K, V> {
      * @return a Set containing the associated values, or an empty Set if the key does not exist
      */
     public Set<V> get(K key) {
-        ConcurrentLinkedQueue<V> queue = map.get(key);
-        if (queue == null) {
+        Set<V> bucket = map.get(key);
+        if (bucket == null) {
             return new HashSet<>();
         }
-        // Create a HashSet of the values; synchronize to avoid concurrent modification issues
-        synchronized (queue) {
-            return new HashSet<>(queue);
+        // Create a copy of the values; synchronize to avoid concurrent modification issues
+        synchronized (bucket) {
+            return new HashSet<>(bucket);
         }
     }
 
     /**
+     * Returns an unmodifiable, weakly consistent <em>view</em> of the values associated with the key.
+     * Unlike {@link #get(K)} this copies nothing, so it suits hot read paths that only iterate the values;
+     * the view reflects later changes to the bucket and never throws {@link java.util.ConcurrentModificationException}.
+     * Callers that need a stable snapshot must use {@link #get(K)}.
+     *
+     * @param key the key
+     * @return a live unmodifiable view of the associated values, or an empty set if the key does not exist
+     */
+    public Set<V> view(K key) {
+        Set<V> bucket = map.get(key);
+        return bucket == null ? Set.of() : Collections.unmodifiableSet(bucket);
+    }
+
+    /**
      * Removes the specified value associated with the key.
-     * If the queue becomes empty after removal, the key is removed from the map.
+     * If the bucket becomes empty after removal, the key is removed from the map.
      *
      * @param key   the key
      * @param value the value to remove
      * @return true if the value was removed, false otherwise
      */
     public boolean remove(K key, V value) {
-        ConcurrentLinkedQueue<V> queue = map.get(key);
-        if (queue == null) {
+        Set<V> bucket = map.get(key);
+        if (bucket == null) {
             return false;
         }
-        synchronized (queue) {
-            boolean removed = queue.remove(value);
-            if (queue.isEmpty()) {
-                map.remove(key, queue);
+        synchronized (bucket) {
+            boolean removed = bucket.remove(value);
+            if (bucket.isEmpty()) {
+                map.remove(key, bucket);
             }
             return removed;
         }
@@ -100,12 +107,12 @@ public class ConcurrentSetMultimap<K, V> {
      * @return a Set containing the removed values, or an empty Set if the key did not exist
      */
     public Set<V> removeAll(K key) {
-        ConcurrentLinkedQueue<V> queue = map.remove(key);
-        if (queue == null) {
+        Set<V> bucket = map.remove(key);
+        if (bucket == null) {
             return new HashSet<>();
         }
-        synchronized (queue) {
-            return new HashSet<>(queue);
+        synchronized (bucket) {
+            return new HashSet<>(bucket);
         }
     }
 
@@ -124,9 +131,9 @@ public class ConcurrentSetMultimap<K, V> {
      */
     public Collection<V> values() {
         Collection<V> allValues = new ArrayList<>();
-        for (ConcurrentLinkedQueue<V> queue : map.values()) {
-            synchronized (queue) {
-                allValues.addAll(queue);
+        for (Set<V> bucket : map.values()) {
+            synchronized (bucket) {
+                allValues.addAll(bucket);
             }
         }
         return allValues;
@@ -163,13 +170,7 @@ public class ConcurrentSetMultimap<K, V> {
     }
 
     public boolean containsEntry(K key, V value) {
-        ConcurrentLinkedQueue<V> queue = map.get(key);
-        if (queue == null) {
-            return false;
-        }
-        synchronized (queue) {
-            return queue.contains(value);
-        }
+        Set<V> bucket = map.get(key);
+        return bucket != null && bucket.contains(value);
     }
 }
-

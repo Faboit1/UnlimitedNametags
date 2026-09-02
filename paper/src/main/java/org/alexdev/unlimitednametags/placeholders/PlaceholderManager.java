@@ -51,8 +51,12 @@ public class PlaceholderManager {
 
     private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("%.*?%", Pattern.DOTALL);
     private static final JoinConfiguration JOIN_CONFIGURATION = JoinConfiguration.separator(Component.newline());
+    private static final Component EMPTY_COMPONENT = Component.empty();
 
     private static final String ELSE_PLACEHOLDER = "ELSE";
+    /** Shared infix of every {@code #phase-…#} token; a cheap pre-filter for {@link #formatPhases(String)}. */
+    private static final String PHASE_MARKER = "phase-";
+    private static final String ELSE_PLACEHOLDER_LOWER = ELSE_PLACEHOLDER.toLowerCase(Locale.ROOT);
     private static final int maxIndex = 16777215;
     private static final int maxMIndex = 10;
     private final UnlimitedNameTags plugin;
@@ -239,12 +243,16 @@ public class PlaceholderManager {
         if (!isDisplayGroupActive(owner, group, relationalConditions ? viewer : null)) {
             return List.of();
         }
-        return group.lines().stream()
-                .filter(line -> line.when() == null
-                        || line.when().isBlank()
-                        || evaluateLineWhen(owner, viewer, line, relationalConditions || containsRelationalPlaceholders(line.when())))
-                .map(Settings.NametagLine::text)
-                .toList();
+        final List<Settings.NametagLine> lines = group.lines();
+        final List<String> texts = new ArrayList<>(lines.size());
+        for (final Settings.NametagLine line : lines) {
+            if (line.when() == null
+                    || line.when().isBlank()
+                    || evaluateLineWhen(owner, viewer, line, relationalConditions || containsRelationalPlaceholders(line.when()))) {
+                texts.add(line.text());
+            }
+        }
+        return texts;
     }
 
     private boolean evaluateLineWhen(@NotNull Player owner, @NotNull Player viewer, @NotNull Settings.NametagLine line, boolean relationalGroup) {
@@ -264,18 +272,18 @@ public class PlaceholderManager {
         final Settings settings = plugin.getConfigManager().getSettings();
         final boolean removeEmptyLines = settings.getBehavior().isRemoveEmptyLines();
 
-        final List<String> baseStrings = papiManager.isPapiEnabled() ?
-                strings.stream()
-                        .map(s -> replacePlaceholders(s, owner, null))
-                        .toList()
-                : strings;
+        final boolean papiEnabled = papiManager.isPapiEnabled();
 
-        final List<Component> processedLines = baseStrings.stream()
-                .map(line -> resolveRelationalPlaceholdersInText(line, owner, viewer))
-                .map(this::formatPhases)
-                .map(line -> format(line, owner))
-                .filter(c -> !removeEmptyLines || !c.equals(Component.empty()))
-                .toList();
+        // One pass instead of four chained streams: this runs per viewer per row per refresh.
+        final List<Component> processedLines = new ArrayList<>(strings.size());
+        for (final String raw : strings) {
+            final String expanded = papiEnabled ? replacePlaceholders(raw, owner, null) : raw;
+            final Component component = format(formatPhases(resolveRelationalPlaceholdersInText(expanded, owner, viewer)), owner);
+            if (removeEmptyLines && EMPTY_COMPONENT.equals(component)) {
+                continue;
+            }
+            processedLines.add(component);
+        }
 
         return joinLines(processedLines);
     }
@@ -326,32 +334,56 @@ public class PlaceholderManager {
         final boolean removeEmptyLines = settings.getBehavior().isRemoveEmptyLines();
         final boolean enableRelationalPlaceholders = settings.getPerformance().isEnableRelationalPlaceholders();
 
-        final List<String> baseStrings = papiManager.isPapiEnabled() ?
-                strings.stream()
-                        .map(s -> replacePlaceholders(s, player, null))
-                        .toList()
-                : strings;
-        final boolean hasRelationalPlaceholders = enableRelationalPlaceholders
-                && baseStrings.stream().anyMatch(PlaceholderManager::containsRelationalPlaceholders);
+        // baseStrings is shared by every viewer, so it stays materialised; the per-viewer stages below
+        // are fused into a single loop to avoid two throwaway lists per viewer.
+        final List<String> baseStrings;
+        boolean anyRelational = false;
+        if (papiManager.isPapiEnabled()) {
+            final List<String> expanded = new ArrayList<>(strings.size());
+            for (final String raw : strings) {
+                final String value = replacePlaceholders(raw, player, null);
+                if (enableRelationalPlaceholders && !anyRelational) {
+                    anyRelational = containsRelationalPlaceholders(value);
+                }
+                expanded.add(value);
+            }
+            baseStrings = expanded;
+        } else {
+            baseStrings = strings;
+            if (enableRelationalPlaceholders) {
+                for (final String value : baseStrings) {
+                    if (containsRelationalPlaceholders(value)) {
+                        anyRelational = true;
+                        break;
+                    }
+                }
+            }
+        }
+        final boolean hasRelationalPlaceholders = enableRelationalPlaceholders && anyRelational;
 
         if (hasRelationalPlaceholders) {
             final Map<Player, Component> result = Maps.newHashMapWithExpectedSize(relationalPlayers.size());
             for (Player viewer : relationalPlayers) {
-                final List<Component> processedLines = baseStrings.stream()
-                        .map(line -> resolveRelationalPlaceholdersInText(line, player, viewer))
-                        .map(this::formatPhases)
-                        .map(line -> format(line, player))
-                        .filter(c -> !removeEmptyLines || !c.equals(Component.empty()))
-                        .toList();
+                final List<Component> processedLines = new ArrayList<>(baseStrings.size());
+                for (final String line : baseStrings) {
+                    final Component component = format(formatPhases(resolveRelationalPlaceholdersInText(line, player, viewer)), player);
+                    if (removeEmptyLines && EMPTY_COMPONENT.equals(component)) {
+                        continue;
+                    }
+                    processedLines.add(component);
+                }
                 result.put(viewer, joinLines(processedLines));
             }
             return result;
         } else {
-            final List<Component> processedLines = baseStrings.stream()
-                    .map(this::formatPhases)
-                    .map(line -> format(line, player))
-                    .filter(c -> !removeEmptyLines || !c.equals(Component.empty()))
-                    .toList();
+            final List<Component> processedLines = new ArrayList<>(baseStrings.size());
+            for (final String line : baseStrings) {
+                final Component component = format(formatPhases(line), player);
+                if (removeEmptyLines && EMPTY_COMPONENT.equals(component)) {
+                    continue;
+                }
+                processedLines.add(component);
+            }
 
             final Component finalComponent = joinLines(processedLines);
 
@@ -380,14 +412,15 @@ public class PlaceholderManager {
                 plugin.getLogger().info("[UNT helmet dbg] computing offset (hat hooks=" + plugin.getHatHooks().size() + ")");
             }
 
-            final List<ItemStack> hatSources = collectHatSources(player);
+            final List<HatHook> hatHooks = plugin.getHatHooks();
+            final List<ItemStack> hatSources = collectHatSources(player, hatHooks);
             if (verbose) {
                 plugin.getLogger().info("[UNT helmet dbg] hat item sources=" + hatSources.size());
             }
 
             double rawHeight = 0d;
             HatHook winner = null;
-            for (final HatHook hook : plugin.getHatHooks()) {
+            for (final HatHook hook : hatHooks) {
                 final double v = hook.getHigh(player.getUniqueId());
                 if (verbose) {
                     plugin.getLogger().info("[UNT helmet dbg]   " + hook.getClass().getSimpleName() + ".getHigh -> " + v);
@@ -435,11 +468,11 @@ public class PlaceholderManager {
         }
     }
 
-    private @NotNull List<ItemStack> collectHatSources(@NotNull Player player) {
+    private @NotNull List<ItemStack> collectHatSources(@NotNull Player player, @NotNull List<HatHook> hatHooks) {
         final List<ItemStack> sources = new ArrayList<>();
         final ItemStack helmet = player.getInventory().getHelmet();
         addHatSource(sources, helmet);
-        for (final HatHook hook : plugin.getHatHooks()) {
+        for (final HatHook hook : hatHooks) {
             if (hook instanceof HatHookPaper paperHook) {
                 for (final ItemStack item : paperHook.getHatItems(player)) {
                     addHatSource(sources, item);
@@ -467,7 +500,9 @@ public class PlaceholderManager {
 
     @NotNull
     private String formatPhases(@NotNull String value) {
-        if (value.indexOf('#') == -1) {
+        // '#' alone is not enough: hex colours (&#ff0000, <#ff0000>) are far more common than phase
+        // markers and used to pay for all six String#replace scans below.
+        if (value.indexOf('#') == -1 || !value.contains(PHASE_MARKER)) {
             return value;
         }
 
@@ -522,13 +557,14 @@ public class PlaceholderManager {
 
     @NotNull
     private Component format(@NotNull String value, @NotNull Player player) {
-        if (plugin.getConfigManager().getSettings().getPerformance().isComponentCaching()) {
+        final Settings settings = plugin.getConfigManager().getSettings();
+        if (settings.getPerformance().isComponentCaching()) {
             return cachedComponents.computeIfAbsent(value, v ->
-                    Formatter.from(plugin.getConfigManager().getSettings().getBehavior().getFormat()).format(plugin, player, v)
+                    Formatter.from(settings.getBehavior().getFormat()).format(plugin, player, v)
             );
         }
 
-        return Formatter.from(plugin.getConfigManager().getSettings().getBehavior().getFormat()).format(plugin, player, value);
+        return Formatter.from(settings.getBehavior().getFormat()).format(plugin, player, value);
     }
 
     @NotNull
@@ -580,6 +616,12 @@ public class PlaceholderManager {
 
     @Nullable
     private String getReplacement(@NotNull String placeholder, @NotNull String value) {
+        // Called once per placeholder occurrence per viewer per refresh; skip the two lower-casing
+        // allocations entirely when no replacements are configured (the common case).
+        if (placeholdersReplacements.isEmpty()) {
+            return null;
+        }
+
         var replacements = placeholdersReplacements.get(placeholder.toLowerCase(Locale.ROOT));
         if (replacements == null) {
             return null;
@@ -590,7 +632,7 @@ public class PlaceholderManager {
             return replacement;
         }
 
-        return replacements.get(ELSE_PLACEHOLDER.toLowerCase(Locale.ROOT));
+        return replacements.get(ELSE_PLACEHOLDER_LOWER);
     }
 
 
@@ -600,7 +642,7 @@ public class PlaceholderManager {
 
     private long effectiveTtlMs(@NotNull String placeholder) {
         final Map<String, Long> rates = perPlaceholderTtlMs;
-        if (rates != null) {
+        if (rates != null && !rates.isEmpty()) {
             final Long custom = rates.get(placeholder.toLowerCase(Locale.ROOT));
             if (custom != null) return custom;
         }

@@ -30,6 +30,13 @@ public final class AdvancedHatHook implements HatHookPaper {
             return 0;
         }
 
+        // getHigh(Player, ItemStack) bails out on empty rules anyway; check first so the common
+        // "no helmetHeightRules configured" install does not copy a helmet ItemStack per refresh.
+        final List<Advanced.HelmetHeightRule> rules = plugin.getConfigManager().getAdvanced().getHelmetHeightRules();
+        if ((rules == null || rules.isEmpty()) && !HelmetDebugContext.isVerbose()) {
+            return 0;
+        }
+
         final ItemStack helmet = player.getInventory().getHelmet();
         return getHigh(player, helmet);
     }
